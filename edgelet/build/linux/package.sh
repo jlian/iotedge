@@ -314,7 +314,8 @@ esac
 docker run --rm \
     --user root \
     -e 'USER=root' \
-    -v "$BUILD_REPOSITORY_LOCALPATH:/project" \
+    --volumes-from $(docker ps --filter "label=Type=codespaces" -q) \
+    -w `pwd` \
     -i \
     $DOCKER_VOLUME_MOUNTS \
     "$DOCKER_IMAGE" \
@@ -330,7 +331,7 @@ docker run --rm \
         . ~/.cargo/env &&
 
         # aziot-edged
-        cd /project/edgelet &&
+        cd edgelet/ &&
         $RUST_TARGET_COMMAND
         $MAKE_COMMAND
     "
