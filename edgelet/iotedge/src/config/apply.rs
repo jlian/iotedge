@@ -202,43 +202,124 @@ async fn execute_inner(
     } = aziotctl_common::config::apply::run(aziot, aziotcs_uid, aziotid_uid)
         .map_err(|err| format!("{:?}", err))?;
 
+    // If there is proxy (or any other edgeAgent env var) value set somewhere somehow
+    // Need to check that the configuration is the same
+    // Otherwise we need to ask the user to recreate edgeAgent
+    // if !agent.env().is_empty() {
+
+    //     // If there's a valid config file, get the value for [agent.env] from before
+    //     if let Ok(old_edged_config) = std::fs::read(&old_edged_path) {
+    //         if let Ok(edgelet_settings::Settings {
+    //             base:
+    //                 edgelet_settings::base::Settings {
+    //                     agent: old_agent, ..
+    //                 },
+    //             ..
+    //         }) = toml::from_slice(&old_edged_config)
+    //         {
+    //             let old_agent_env = old_agent.env();
+
+    //             //TODO: find the comparison function for &BTreeMap
+
+    //             // if old_agent_env.len() != new_agent_env.len()
+    //             // || !old_agent_env.keys().all(|k| new_agent_env.contains_key(k))
+    //             // || !old_agent_env.values().all(|v| new_agent_env.contains_value(v)) {
+
+    //             if old_agent_env != new_agent_env {
+    //                 return Err(format!("Cannot apply config because desired agent.env config {} is different from the previous agent.env {}. To update the edgeAgent environment variables, run the following command which recreates the edgeAgent container reapplies the configuration. Or, revert the agent.env change in config.toml.
+    //                                 sudo iotedge system stop && sudo docker rm -f edgeAgent && sudo iotedge config apply.
+    //                                 Warning: Data stored in all modules is lost when above command is executed.", &new_agent_env.len(), &old_agent_env.len()).into());
+    //             }
+    //         }
+    //     }
+    // }
+
+    let old_edged_path = Path::new("/etc/aziot/edged/config.d/00-super.toml"); // Couldn't this be user defined?
     let old_identityd_path = Path::new("/etc/aziot/identityd/config.d/00-super.toml");
-    if let Ok(old_identity_config) = std::fs::read(&old_identityd_path) {
-        if let Ok(aziot_identityd_config::Settings { hostname, .. }) =
-            toml::from_slice(&old_identity_config)
-        {
-            let new_hostname = &identityd_config.hostname;
-            let moby_runtime = &moby_runtime;
-            let uri = &moby_runtime.uri;
 
-            let client = DockerApiClient::new(
-                Connector::new(uri)
-                    .map_err(|err| format!("Failed to make docker client: {}", err))?,
-            );
+    // This block stops the user from applying config if it'll result in
+    // Env variable changes
+    // We ask the user to stop everything and recreate the containers
+    if std::fs::read(&old_identityd_path).is_ok() || std::fs::read(&old_edged_path).is_ok() {
+        // Create moby client so we can check if containers are running
+        // Since we need to let users apply ONLY when containers are NOT running
+        let moby_runtime = &moby_runtime;
+        let uri = &moby_runtime.uri;
+        let client = DockerApiClient::new(
+            Connector::new(uri).map_err(|err| format!("Failed to make docker client: {}", err))?,
+        );
+        let mut filters = HashMap::new();
+        filters.insert("label", LABELS);
+        let filters = serde_json::to_string(&filters).map_err(|err| format!("{:?}", err))?;
+        let containers = client
+            .container_list(
+                true,  /*all*/
+                0,     /*limit*/
+                false, /*size*/
+                &filters,
+            )
+            .await
+            .map_err(|err| format!("{:?}", err))?;
 
-            let mut filters = HashMap::new();
-            filters.insert("label", LABELS);
-            let filters = serde_json::to_string(&filters).map_err(|err| format!("{:?}", err))?;
-
-            let containers = client
-                .container_list(
-                    true,  /*all*/
-                    0,     /*limit*/
-                    false, /*size*/
-                    &filters,
-                )
-                .await
-                .map_err(|err| format!("{:?}", err))?;
-            if &hostname != new_hostname && !containers.is_empty() {
-                return Err(format!("Cannot apply config because the hostname in the config {} is different from the previous hostname {}. To update the hostname, run the following command which deletes all modules and reapplies the configuration. Or, revert the hostname change in the config.toml file.
-                    sudo iotedge system stop && sudo docker rm -f $(docker ps -aq) && sudo iotedge config apply.
-                Warning: Data stored in the modules is lost when above command is executed.", &hostname, &new_hostname).into());
+        // Desired hostname config different compared to old hostname
+        // Also some containers are running
+        // Exit and make user run manual command
+        if let Ok(old_identity_config) = std::fs::read(&old_identityd_path) {
+            if let Ok(aziot_identityd_config::Settings { hostname, .. }) =
+                toml::from_slice(&old_identity_config)
+            {
+                let new_hostname = &identityd_config.hostname;
+                if &hostname != new_hostname && !containers.is_empty() {
+                    return Err(format!("\
+                    Cannot apply config because the hostname in the config {} is different from the previous hostname {}.\n\
+                    To update the hostname, use this command to delete all modules and reapply the configuration.\n   \
+                        sudo iotedge system stop && sudo docker rm -f $(docker ps -aq) && sudo iotedge config apply \n\
+                    WARNING: Data stored in the modules is lost when above command is executed. To avoid data loss, revert the hostname change in  config.toml.", &hostname, &new_hostname).into());
+                }
+            } else {
+                println!("Warning: the previous identity config file is unreadable");
             }
-        } else {
-            println!("Warning: the previous identity config file is unreadable");
+        }
+        // Desired edgeAgent env config different than before
+        // Also some containers are running
+        // Make user stop edgeAgent before applying again
+        if let Ok(old_edged_config) = std::fs::read(&old_edged_path) {
+            if let Ok(edgelet_settings::Settings {
+                base:
+                    edgelet_settings::base::Settings {
+                        agent: old_agent, ..
+                    },
+                ..
+            }) = toml::from_slice(&old_edged_config)
+            {
+                let new_agent_env = agent.env();
+                let old_agent_env = old_agent.env();
+
+                // TODO: compare len() first to kick out earlier
+                // TODO: does this comparison function work as expected?
+                // ✅ Change value = block
+                // ✅ Change key = block
+                // ✅ Change order = not block
+                // ✅ Add new value = block
+                // ✅ Remove value = block
+                // ✅ Some -> 0 case
+                // ✅ 0 -> Some case
+                // Containers running = block
+                // ✅ Containers not running = not block
+                // if old_agent_env != new_agent_env && !containers.is_empty() {
+                if old_agent_env != new_agent_env {
+                    return Err(format!("\
+                    Cannot apply config because desired agent.env config with {} value(s) is different from the previous agent.env with {} value(s). \n\
+                    To update the edgeAgent environment variables, use this command to recreate the edgeAgent container then reapply the configuration. \n    \
+                        sudo iotedge system stop && sudo docker rm -f $(docker ps -aq) && sudo iotedge config apply \n\
+                    WARNING: Data stored in all modules is lost when above command is executed. To avoid this, revert the agent.env change in config.toml.", &new_agent_env.len(), &old_agent_env.len()).into());
+                }
+            } else {
+                println!("Warning: the previous edged config file is unreadable");
+            }
         }
     } else {
-        println!("Warning: the previous identity config file is unreadable");
+        println!("Warning: the previous identity or edged config file is unreadable");
     }
     let mut iotedge_authorized_certs = vec![
         edgelet_settings::AZIOT_EDGED_CA_ALIAS.to_owned(),
